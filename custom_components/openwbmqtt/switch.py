@@ -139,6 +139,16 @@ class openwbSwitch(OpenWBBaseEntity, SwitchEntity):
         # self.schedule_update_ha_state()
 
     def publishToMQTT(self):
-        """Publish data to MQTT."""
+        """Publish data to MQTT using the service call method."""
         topic = f"{self.entity_description.mqttTopicCommand}"
-        self.hass.components.mqtt.publish(self.hass, topic, str(int(self._attr_is_on)))
+        payload = str(int(self._attr_is_on))
+
+        # Die Umstellung:
+        self.hass.services.call(
+            "mqtt",
+            "publish",
+            {
+                "topic": topic,
+                "payload": payload
+            },
+        )
