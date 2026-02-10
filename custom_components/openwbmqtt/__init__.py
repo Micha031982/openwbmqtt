@@ -1,12 +1,12 @@
-# Updated MQTT API calls
+import logging
 
-# Original content would be here with modifications applied below.
+from homeassistant import config_entries, core
+from homeassistant.helpers import device_registry, entity_registry
 
-# Replacing instances of hass.components.mqtt.publish with hass.services.call
-# For example:
+_LOGGER = logging.getLogger(__name__)
 
-# Previous:
-# hass.components.mqtt.publish(hass, topic, payload)
+async def publish_mqtt(hass, topic, payload):
+    # Replaced the call with hass.services.call
+    hass.services.call("mqtt", "publish", {"topic": topic, "payload": payload})
 
-# Updated:
-# hass.services.call("mqtt", "publish", {"topic": topic, "payload": payload},)
+# Your remaining code ...
