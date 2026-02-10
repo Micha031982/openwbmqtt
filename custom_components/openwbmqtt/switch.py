@@ -1,23 +1,18 @@
-"""The openwbmqtt component for controlling the openWB wallbox via home assistant / MQTT."""
+"""Support for openWB MQTT switches."""
 from __future__ import annotations
 
-import copy
 import logging
+from typing import Any
 
-from homeassistant.components import mqtt
-from homeassistant.components.switch import DOMAIN, SwitchEntity
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import slugify
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .common import OpenWBBaseEntity
-from .const import (
-    CHARGE_POINTS,
-    MQTT_ROOT_TOPIC,
-    SWITCHES_PER_LP,
-    openwbSwitchEntityDescription,
-)
+from .const import DOMAIN, SWITCH_TYPES
+from .coordinator import OpenWBMqttDataUpdateCoordinator
+from .models import OpenWBMqttEntityDescription
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,128 +22,67 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Return switch entities."""
-    integrationUniqueID = config_entry.unique_id
-    mqttRoot = config_entry.data[MQTT_ROOT_TOPIC]
-    nChargePoints = config_entry.data[CHARGE_POINTS]
+    """Set up openWB MQTT switch entities."""
+    coordinator: OpenWBMqttDataUpdateCoordinator = hass.data[DOMAIN][
+        config_entry.entry_id
+    ]
 
-    switchList = []
-
-    # todo: global switches
-
-    for chargePoint in range(1, nChargePoints + 1):
-        localSwitchesPerLP = copy.deepcopy(SWITCHES_PER_LP)
-        for description in localSwitchesPerLP:
-            if description.mqttTopicChargeMode:
-                description.mqttTopicCommand = f"{mqttRoot}/config/set/{str(description.mqttTopicChargeMode)}/lp/{str(chargePoint)}/{description.mqttTopicCommand}"
-                description.mqttTopicCurrentValue = f"{mqttRoot}/config/get/{str(description.mqttTopicChargeMode)}/lp/{str(chargePoint)}/{description.mqttTopicCurrentValue}"
-            else:  # for manual SoC module
-                description.mqttTopicCommand = f"{mqttRoot}/set/lp/{str(chargePoint)}/{description.mqttTopicCommand}"
-                description.mqttTopicCurrentValue = f"{mqttRoot}/lp/{str(chargePoint)}/{description.mqttTopicCurrentValue}"
-            switchList.append(
-                openwbSwitch(
-                    unique_id=integrationUniqueID,
-                    description=description,
-                    nChargePoints=int(nChargePoints),
-                    currentChargePoint=chargePoint,
-                    device_friendly_name=integrationUniqueID,
-                    mqtt_root=mqttRoot,
-                )
-            )
-
-    async_add_entities(switchList)
+    entities = [
+        OpenWBMqttSwitch(coordinator, description)
+        for description in SWITCH_TYPES
+        if description.exists_fn(coordinator.data)
+    ]
+    async_add_entities(entities)
 
 
-class openwbSwitch(OpenWBBaseEntity, SwitchEntity):
-    """Entity representing the inverter operation mode."""
+class OpenWBMqttSwitch(CoordinatorEntity, SwitchEntity):
+    """Representation of an openWB MQTT switch."""
 
-    entity_description: openwbSwitchEntityDescription
+    entity_description: OpenWBMqttEntityDescription
+    _attr_has_entity_name = True
 
     def __init__(
         self,
-        unique_id: str,
-        device_friendly_name: str,
-        description: openwbSwitchEntityDescription,
-        mqtt_root: str,
-        currentChargePoint: int | None = None,
-        nChargePoints: int | None = None,
+        coordinator: OpenWBMqttDataUpdateCoordinator,
+        description: OpenWBMqttEntityDescription,
     ) -> None:
-        """Initialize the sensor and the openWB device."""
-        super().__init__(
-            device_friendly_name=device_friendly_name,
-            mqtt_root=mqtt_root,
-        )
-        # Initialize the inverter operation mode setting entity
+        """Initialize the switch."""
+        super().__init__(coordinator)
         self.entity_description = description
+        self._attr_unique_id = f"{description.key}"
+        self._attr_device_info = coordinator.device_info
+        self._attr_is_on = bool(description.value_fn(coordinator.data))
 
-        if nChargePoints:
-            self._attr_unique_id = slugify(
-                f"{unique_id}-CP{currentChargePoint}-{description.name}"
-            )
-            self.entity_id = (
-                f"{DOMAIN}.{unique_id}-CP{currentChargePoint}-{description.name}"
-            )
-            self._attr_name = f"{description.name} (LP{currentChargePoint})"
-        else:
-            self._attr_unique_id = slugify(f"{unique_id}-{description.name}")
-            self.entity_id = f"{DOMAIN}.{unique_id}-{description.name}"
-            self._attr_name = description.name
-
-    async def async_added_to_hass(self):
-        """Subscribe to MQTT events."""
-
-        @callback
-        def message_received(message):
-            if int(message.payload) == 1:
-                self._attr_is_on = True
-            elif int(message.payload) == 0:
-                self._attr_is_on = False
-            else:
-                self._attr_is_on = None
-
-            self.async_write_ha_state()
-
-        # Subscribe to MQTT topic and connect callack message
-        await mqtt.async_subscribe(
-            self.hass,
-            self.entity_description.mqttTopicCurrentValue,
-            message_received,
-            1,
-        )
-
-    def turn_on(self, **kwargs):
-        """Turn the switch on.
-
-        After turn_on --> the result is published to MQTT.
-        But the HA sensor shall only change when the MQTT message on the /get/ topic is received.
-        Only then, openWB has changed the setting as well.
-        """
-        self._attr_is_on = True
-        self.publishToMQTT()
-        # self.schedule_update_ha_state()
-
-    def turn_off(self, **kwargs):
-        """Turn the device off.
-
-        After turn_off --> the result is published to MQTT.
-        But the HA sensor shall only change when the MQTT message on the /get/ topic is received.
-        Only then, openWB has changed the setting as well.
-        """
-        self._attr_is_on = False
-        self.publishToMQTT()
-        # self.schedule_update_ha_state()
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._attr_is_on = bool(self.entity_description.value_fn(self.coordinator.data))
+        self.async_write_ha_state()
 
     def publishToMQTT(self):
-        """Publish data to MQTT using the service call method."""
+        """Publish data to MQTT using the internal service call."""
         topic = f"{self.entity_description.mqttTopicCommand}"
         payload = str(int(self._attr_is_on))
 
-        # Die Umstellung:
+        # Hier die wichtige Änderung auf self.hass.services.call
         self.hass.services.call(
             "mqtt",
             "publish",
             {
                 "topic": topic,
-                "payload": payload
+                "payload": payload,
+                "retain": False
             },
         )
+
+    def turn_on(self, **kwargs: Any) -> None:
+        """Turn the entity on."""
+        self._attr_is_on = True
+        self.publishToMQTT()
+        self.async_write_ha_state()
+
+    def turn_off(self, **kwargs: Any) -> None:
+        """Turn the entity off."""
+        self._attr_is_on = False
+        self.publishToMQTT()
+        self.async_write_ha_state()
