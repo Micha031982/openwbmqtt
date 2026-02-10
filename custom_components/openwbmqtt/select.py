@@ -132,15 +132,18 @@ class openwbSelect(OpenWBBaseEntity, SelectEntity):
             )
 
     async def async_select_option(self, option: str) -> None:
-        """Change the selected option.
-
-        After select --> the result is published to MQTT.
-        But the HA sensor shall only change when the MQTT message on the /get/ topic is received.
-        Only then, openWB has changed the setting as well.
-        """
-        self.publishToMQTT(option)
-        # self._attr_current_option = option
-        # self.async_write_ha_state()
+        """Change the selected option."""
+        topic = self.entity_description.mqttTopicCommand
+        payload = self.entity_description.payload_dict.get(option)
+    
+        # Umstellung auf service call
+        await self.hass.services.async_call(
+            "mqtt",
+            "publish",
+            {"topic": topic, "payload": payload},
+        )
+        self._attr_current_option = option
+        self.async_write_ha_state()
 
     def publishToMQTT(self, commandValueToPublish):
         """Publish data to MQTT."""
