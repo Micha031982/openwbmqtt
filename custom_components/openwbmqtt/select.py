@@ -1,17 +1,26 @@
-"""Support for openWB MQTT selects."""
+"""OpenWB Selector."""
 from __future__ import annotations
 
+import copy
 import logging
 
-from homeassistant.components.select import SelectEntity
+from homeassistant.components import mqtt
+from homeassistant.components.select import DOMAIN, SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import slugify
+from homeassistant.components.mqtt import publish
 
-from .const import DOMAIN, SELECT_TYPES
-from .coordinator import OpenWBMqttDataUpdateCoordinator
-from .models import OpenWBMqttEntityDescription
+
+from .common import OpenWBBaseEntity
+from .const import (
+    CHARGE_POINTS,
+    MQTT_ROOT_TOPIC,
+    SELECTS_GLOBAL,
+    SELECTS_PER_LP,
+    openwbSelectEntityDescription,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,61 +30,132 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up openWB MQTT select entities."""
-    coordinator: OpenWBMqttDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.entry_id
-    ]
+    """Return selectors."""
 
-    entities = [
-        OpenWBMqttSelect(coordinator, description)
-        for description in SELECT_TYPES
-        if description.exists_fn(coordinator.data)
-    ]
-    async_add_entities(entities)
+    integrationUniqueID = config_entry.unique_id
+    mqttRoot = config_entry.data[MQTT_ROOT_TOPIC]
+    nChargePoints = config_entry.data[CHARGE_POINTS]
+
+    selectList = []
+    global_selects = copy.deepcopy(SELECTS_GLOBAL)
+    for description in global_selects:
+        description.mqttTopicCommand = f"{mqttRoot}/{description.mqttTopicCommand}"
+        description.mqttTopicCurrentValue = (
+            f"{mqttRoot}/{description.mqttTopicCurrentValue}"
+        )
+        selectList.append(
+            openwbSelect(
+                unique_id=integrationUniqueID,
+                description=description,
+                device_friendly_name=integrationUniqueID,
+                mqtt_root=mqttRoot,
+            )
+        )
+    for chargePoint in range(1, nChargePoints + 1):
+        local_selects_per_lp = copy.deepcopy(SELECTS_PER_LP)
+        for description in local_selects_per_lp:
+            description.mqttTopicCommand = f"{mqttRoot}/config/set/sofort/lp/{str(chargePoint)}/{description.mqttTopicCommand}"
+            description.mqttTopicCurrentValue = f"{mqttRoot}/config/get/sofort/lp/{str(chargePoint)}/{description.mqttTopicCurrentValue}"
+            selectList.append(
+                openwbSelect(
+                    unique_id=integrationUniqueID,
+                    description=description,
+                    nChargePoints=int(nChargePoints),
+                    currentChargePoint=chargePoint,
+                    device_friendly_name=integrationUniqueID,
+                    mqtt_root=mqttRoot,
+                )
+            )
+    async_add_entities(selectList)
 
 
-class OpenWBMqttSelect(CoordinatorEntity, SelectEntity):
-    """Representation of an openWB MQTT select."""
+class openwbSelect(OpenWBBaseEntity, SelectEntity):
+    """Entity representing the inverter operation mode."""
 
-    entity_description: OpenWBMqttEntityDescription
-    _attr_has_entity_name = True
+    entity_description: openwbSelectEntityDescription
 
     def __init__(
         self,
-        coordinator: OpenWBMqttDataUpdateCoordinator,
-        description: OpenWBMqttEntityDescription,
+        unique_id: str,
+        device_friendly_name: str,
+        description: openwbSelectEntityDescription,
+        mqtt_root: str,
+        currentChargePoint: int | None = None,
+        nChargePoints: int | None = None,
     ) -> None:
-        """Initialize the select."""
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._attr_unique_id = f"{description.key}"
-        self._attr_device_info = coordinator.device_info
-        self._attr_options = list(description.payload_dict.keys())
-        self._attr_current_option = description.value_fn(coordinator.data)
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        self._attr_current_option = self.entity_description.value_fn(
-            self.coordinator.data
+        """Initialize the sensor and the openWB device."""
+        super().__init__(
+            device_friendly_name=device_friendly_name,
+            mqtt_root=mqtt_root,
         )
-        self.async_write_ha_state()
+        # Initialize the inverter operation mode setting entity
+        self.entity_description = description
+
+        if nChargePoints:
+            self._attr_unique_id = slugify(
+                f"{unique_id}-CP{currentChargePoint}-{description.name}"
+            )
+            self.entity_id = (
+                f"{DOMAIN}.{unique_id}-CP{currentChargePoint}-{description.name}"
+            )
+            self._attr_name = f"{description.name} (LP{currentChargePoint})"
+        else:
+            self._attr_unique_id = slugify(f"{unique_id}-{description.name}")
+            self.entity_id = f"{DOMAIN}.{unique_id}-{description.name}"
+            self._attr_name = description.name
+
+        self._attr_options = description.modes
+        self._attr_current_option = None
+
+    async def async_added_to_hass(self):
+        """Subscribe to MQTT events."""
+
+        @callback
+        def message_received(message):
+            """Handle new MQTT messages."""
+            try:
+                self._attr_current_option = (
+                    self.entity_description.valueMapCurrentValue.get(
+                        int(message.payload)
+                    )
+                )
+            except ValueError:
+                self._attr_current_option = None
+
+            self.async_write_ha_state()
+
+        # Subscribe to MQTT topic and connect callack message
+        if self.entity_description.mqttTopicCurrentValue is not None:
+            await mqtt.async_subscribe(
+                self.hass,
+                self.entity_description.mqttTopicCurrentValue,
+                message_received,
+                1,
+            )
 
     async def async_select_option(self, option: str) -> None:
-        """Update the current value via MQTT service call."""
-        topic = self.entity_description.mqttTopicCommand
-        payload = self.entity_description.payload_dict.get(option)
+        """Change the selected option.
 
-        # Umstellung auf den asynchronen Service Call
-        await self.hass.services.async_call(
-            "mqtt",
-            "publish",
-            {
-                "topic": topic,
-                "payload": payload,
-                "retain": False
-            },
-        )
-        
-        self._attr_current_option = option
-        self.async_write_ha_state()
+        After select --> the result is published to MQTT.
+        But the HA sensor shall only change when the MQTT message on the /get/ topic is received.
+        Only then, openWB has changed the setting as well.
+        """
+        self.publishToMQTT(option)
+        # self._attr_current_option = option
+        # self.async_write_ha_state()
+
+    def publishToMQTT(self, commandValueToPublish):
+        """Publish data to MQTT."""
+        topic = f"{self.entity_description.mqttTopicCommand}"
+        _LOGGER.debug("MQTT topic: %s", topic)
+        try:
+            payload = self.entity_description.valueMapCommand.get(commandValueToPublish)
+            _LOGGER.debug("MQTT payload: %s", payload)
+            publish_mqtt_message = True
+        except ValueError:
+            publish_mqtt_message = False
+
+        if publish_mqtt_message:
+            publish(self.hass, topic, payload)
+            # self.hass.components.mqtt.publish(self.hass, topic, payload) # stop working in Home Assistant 2025.3
+            
